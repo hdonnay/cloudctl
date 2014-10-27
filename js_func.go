@@ -1,10 +1,8 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
-	"fmt"
-	"io"
+	"log"
 	"os"
 	"os/exec"
 	"strings"
@@ -26,7 +24,12 @@ func JS_include(call otto.FunctionCall) otto.Value {
 		debug("include:", err)
 		return otto.FalseValue()
 	}
-	if _, err := call.Otto.Run(f); err != nil {
+	s, err := call.Otto.Compile(f.Name(), f)
+	if err != nil {
+		debug("include:", err)
+		return otto.FalseValue()
+	}
+	if _, err := call.Otto.Run(s); err != nil {
 		debug("include:", err)
 		return otto.FalseValue()
 	}
@@ -132,75 +135,55 @@ func JS_shell(call otto.FunctionCall) otto.Value {
 	return ret
 }
 
-func injectRun(m *map[string]*Ctx) func(otto.FunctionCall) otto.Value {
-	ctx := *m
-	return func(call otto.FunctionCall) otto.Value {
-		this := call.This.Object()
-		hostVal, err := this.Get("host")
-		if err != nil {
-			debug("run:", err)
-			call.Otto.Run(fmt.Sprintf(`throw "%s";`, err))
-		}
-		host := hostVal.String()
-		c := ctx[host]
-		s, err := c.client.NewSession()
-		if err != nil {
-			debug("run:", err)
-			return otto.FalseValue()
-		}
-		wg := &sync.WaitGroup{}
-		wg.Add(2)
-		go func() {
-			o, _ := s.StdoutPipe()
-			r := bufio.NewReader(o)
-			debug("run:", "stdout started")
-			for line, err := r.ReadString('\n'); err != io.EOF; line, err = r.ReadString('\n') {
-				fmt.Printf("[%s:s]\t%s\n", host, line)
-			}
-			wg.Done()
-		}()
-		go func() {
-			o, _ := s.StdoutPipe()
-			r := bufio.NewReader(o)
-			debug("run:", "stderr started")
-			for line, err := r.ReadString('\n'); err != io.EOF; line, err = r.ReadString('\n') {
-				fmt.Printf("[%s:e]\t%s\n", host, line)
-			}
-			wg.Done()
-		}()
-		debug("run:", "running")
-		s.Run(call.Argument(0).String())
-		debug("run:", "ran")
-		wg.Wait()
-		debug("run:", "returning")
-		return otto.TrueValue()
-	}
-}
-
 func JS_do(call otto.FunctionCall) otto.Value {
-	task := call.Argument(0).Object()
-	v, err := call.Argument(1).Export()
+	cloudVal, err := call.Argument(0).Export()
 	if err != nil {
-		debug("_do:", err)
-		call.Otto.Run(fmt.Sprintf(`throw "%s";`, err))
+		return otto.FalseValue()
 	}
-	hosts := make([]string, len(v.([]string)))
-	for i, s := range v.([]string) {
-		hosts[i] = s
-	}
+	cloud := cloudVal.(map[string]interface{})
 
+	// create our worker pool
 	wg := &sync.WaitGroup{}
 	wg.Add(*pool)
 	work := make(chan string)
+	ctx := MakeCtx()
 	for i := 0; i < *pool; i++ {
 		go func() {
 			defer wg.Done()
 			for h := range work {
-				debug("_do:", h)
-				task.Call("run", h)
+				// each host gets it own copy of the js runtime, now that it's populated.
+				// we can then inject host-specific functions.
+				vm := call.Otto.Copy()
+				if err := vm.Set("_run", injectRun(ctx, h)); err != nil {
+					log.Println(err)
+					return
+				}
+				tasks, err := cloud["Tasks"].(otto.Value).Export()
+				if err != nil {
+					log.Println("unable to determine task list")
+					return
+				}
+				for _, t := range tasks.([]interface{}) {
+					debug("worker", i, t.(string))
+					_, err := vm.Run("cloud._tasks." + t.(string) + "(_run)")
+					if err != nil {
+						log.Println(err)
+						break
+					}
+				}
 			}
 		}()
 	}
+
+	hostVal, err := cloud["Hosts"].(otto.Value).Export()
+	if err != nil {
+		return otto.FalseValue()
+	}
+	hosts := make([]string, len(hostVal.([]interface{})))
+	for i, s := range hostVal.([]interface{}) {
+		hosts[i] = s.(string)
+	}
+
 	for _, h := range hosts {
 		work <- h
 	}
