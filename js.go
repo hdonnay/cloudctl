@@ -11,7 +11,6 @@ if(typeof lookup !== "undefined"){
 		_.union(_.flatten(_.map(cloud.Roles, lookup)), cloud.Hosts),
 		function(s){return s != ""});
 }
-console.log(JSON.stringify(cloud));
 _do(cloud);`)
 )
 
